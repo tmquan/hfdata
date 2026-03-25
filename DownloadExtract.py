@@ -106,6 +106,8 @@ class PipelineConfig:
     max_seq_length: int = 32768
     chunk_size: int = 10000
     files_per_partition: int = 1
+    skip_embedding: bool = False
+    config_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> PipelineConfig:
@@ -125,6 +127,15 @@ class PipelineConfig:
 
         known = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
         return cls(**known)
+
+    def for_config(self, config_name: str) -> PipelineConfig:
+        """Return a copy with per-config overrides applied."""
+        overrides = self.config_overrides.get(config_name, {})
+        if not overrides:
+            return self
+        import dataclasses
+        vals = {k: overrides[k] for k in overrides if k in self.__dataclass_fields__}
+        return dataclasses.replace(self, **vals)
 
 
 def parse_args() -> argparse.Namespace:
@@ -240,16 +251,47 @@ def create_output_dirs(
     return raw_dir, pre_dir, emb_dir, red_dir
 
 
-def canonicalise_parquet_names(directory: Path) -> int:
-    """Rename ``*.parquet`` files in *directory* to
-    ``part-NNNNNN-of-MMMMMM.parquet`` and return the count."""
-    files = sorted(directory.glob("*.parquet"))
-    total = len(files)
-    for idx, src in enumerate(files, start=1):
-        dst = src.parent / f"part-{idx:06d}-of-{total:06d}.parquet"
-        if src != dst:
-            src.rename(dst)
-    return total
+def rechunk_parquet(directory: Path, chunk_size: int) -> int:
+    """Split parquet files in *directory* into chunks of at most *chunk_size*
+    rows, then rename everything to ``part-NNNNNN-of-MMMMMM.parquet``.
+
+    This avoids the PyArrow 2 GB ``string`` offset overflow that occurs when
+    a single partition holds too much text data.
+    """
+    import pandas as pd
+
+    src_files = sorted(directory.glob("*.parquet"))
+    if not src_files:
+        return 0
+
+    total_rows = sum(
+        pd.read_parquet(f, columns=[]).shape[0] for f in src_files
+    )
+    if total_rows <= chunk_size and len(src_files) == 1:
+        # Already small enough — just canonicalise the name
+        n_parts = 1
+        dst = directory / f"part-{1:06d}-of-{n_parts:06d}.parquet"
+        if src_files[0] != dst:
+            src_files[0].rename(dst)
+        return n_parts
+
+    part_idx = 0
+    tmp_parts: list[Path] = []
+    for src in src_files:
+        df = pd.read_parquet(src)
+        for start in range(0, len(df), chunk_size):
+            part_idx += 1
+            tmp = directory / f".tmp_part_{part_idx:06d}.parquet"
+            df.iloc[start : start + chunk_size].to_parquet(tmp, index=False)
+            tmp_parts.append(tmp)
+        src.unlink()
+
+    n_parts = len(tmp_parts)
+    for idx, tmp in enumerate(tmp_parts, start=1):
+        dst = directory / f"part-{idx:06d}-of-{n_parts:06d}.parquet"
+        tmp.rename(dst)
+
+    return n_parts
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -328,10 +370,15 @@ def main() -> None:
             logger.info(f"  Found {len(pairs)} config/split pair(s)")
 
             for config_name, split in pairs:
-                logger.info(f"  ▸ config={config_name!r}  split={split!r}")
+                ccfg = cfg.for_config(config_name)
+                logger.info(
+                    f"  ▸ config={config_name!r}  split={split!r}  "
+                    f"(batch_size={ccfg.batch_size}, "
+                    f"max_seq_length={ccfg.max_seq_length})"
+                )
 
                 raw_dir, pre_dir, emb_dir, red_dir = create_output_dirs(
-                    base_dir, dataset_name, config_name, split, cfg.model_id
+                    base_dir, dataset_name, config_name, split, ccfg.model_id
                 )
 
                 # ── Pipeline 1: download + extract ───────────────────
@@ -374,7 +421,7 @@ def main() -> None:
 
                     pipeline_dl.add_stage(
                         ParquetWriter(path=str(pre_dir))
-                        if cfg.output_format == "parquet"
+                        if ccfg.output_format == "parquet"
                         else JsonlWriter(path=str(pre_dir))
                     )
 
@@ -383,11 +430,25 @@ def main() -> None:
                     dl_tasks = len(dl_results) if dl_results else 0
                     logger.info(f"    Download complete — {dl_tasks} task(s)")
 
-                    if cfg.output_format == "parquet":
-                        n = canonicalise_parquet_names(pre_dir)
-                        logger.info(f"    Renamed {n} preprocessed file(s)")
+                    if ccfg.output_format == "parquet":
+                        n = rechunk_parquet(pre_dir, ccfg.chunk_size)
+                        logger.info(f"    Split into {n} preprocessed chunk(s)")
 
                 # ── Pipeline 2: embedding generation ─────────────────
+                if ccfg.skip_embedding:
+                    logger.info("    SKIP embedding — skip_embedding=true")
+                    summary.append({
+                        "dataset": dataset_name,
+                        "config": config_name,
+                        "split": split,
+                        "dl_tasks": dl_tasks,
+                        "emb_tasks": 0,
+                        "dl_status": "skipped" if pre_status == StageStatus.COMPLETE and not args.force else "ran",
+                        "emb_status": "skip_embedding",
+                        "output": str(pre_dir),
+                    })
+                    continue
+
                 emb_status, emb_count = check_stage_status(emb_dir)
                 logger.info(
                     f"    embeddings/   status={emb_status.value} "
@@ -440,18 +501,19 @@ def main() -> None:
                         stages=[
                             ParquetReader(
                                 file_paths=input_files,
-                                files_per_partition=cfg.files_per_partition,
+                                files_per_partition=ccfg.files_per_partition,
                                 fields=["text"],
                                 _generate_ids=False,
+                                read_kwargs={"dtype_backend": "numpy_nullable"},
                             ),
                             EmbeddingCreatorStage(
-                                model_identifier=cfg.model_id,
+                                model_identifier=ccfg.model_id,
                                 use_sentence_transformer=False,
                                 text_field="text",
-                                max_seq_length=cfg.max_seq_length,
+                                max_seq_length=ccfg.max_seq_length,
                                 max_chars=None,
-                                embedding_pooling=cfg.embedding_pooling,
-                                model_inference_batch_size=cfg.batch_size,
+                                embedding_pooling=ccfg.embedding_pooling,
+                                model_inference_batch_size=ccfg.batch_size,
                             ),
                             ParquetWriter(
                                 path=str(emb_dir),
@@ -463,7 +525,7 @@ def main() -> None:
                     logger.info(f"    Running embedding pipeline …")
                     emb_results = pipeline_emb.run()
                     emb_tasks = len(emb_results) if emb_results else 0
-                    canonicalise_parquet_names(emb_dir)
+                    rechunk_parquet(emb_dir, ccfg.chunk_size)
                     logger.info(
                         f"    Embedding complete — {emb_tasks} task(s)"
                     )

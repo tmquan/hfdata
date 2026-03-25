@@ -40,13 +40,7 @@ class PipelineConfig:
     cache_dir: str = "~/.cache/huggingface"
     output_format: str = "parquet"
     model_id: str = "nvidia/llama-embed-nemotron-8b"
-    embedding_dim: int = 4096
-    embedding_pooling: str = "mean_pooling"
-    batch_size: int = 8
-    num_gpus: int = 8
-    max_seq_length: int = 32768
-    chunk_size: int = 10000
-    files_per_partition: int = 1
+    config_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> PipelineConfig:
@@ -66,6 +60,15 @@ class PipelineConfig:
 
         known = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
         return cls(**known)
+
+    def for_config(self, config_name: str) -> PipelineConfig:
+        """Return a copy with per-config overrides applied."""
+        overrides = self.config_overrides.get(config_name, {})
+        if not overrides:
+            return self
+        import dataclasses
+        vals = {k: v for k, v in overrides.items() if k in self.__dataclass_fields__}
+        return dataclasses.replace(self, **vals)
 
 
 def parse_args() -> argparse.Namespace:
@@ -168,17 +171,15 @@ def enumerate_dataset_splits(dataset_name: str) -> list[tuple[str, str]]:
 
 
 def create_output_dirs(
-    base: Path, dataset_name: str, config: str, split: str, model_id: str,
-) -> tuple[Path, Path, Path, Path]:
-    """Create and return ``(raw, preprocessed, embeddings, embreduced)``."""
+    base: Path, dataset_name: str, config: str, split: str,
+) -> tuple[Path, Path]:
+    """Create and return ``(raw, preprocessed)``."""
     root = base / dataset_name / config / split
     raw_dir = root / "raw"
     pre_dir = root / "preprocessed"
-    emb_dir = root / "embeddings" / model_id
-    red_dir = root / "embreduced" / model_id
-    for d in (raw_dir, pre_dir, emb_dir, red_dir):
+    for d in (raw_dir, pre_dir):
         d.mkdir(parents=True, exist_ok=True)
-    return raw_dir, pre_dir, emb_dir, red_dir
+    return raw_dir, pre_dir
 
 
 def canonicalise_parquet_names(directory: Path) -> int:
@@ -223,7 +224,6 @@ def main() -> None:
     logger.info(f"Output directory : {base_dir}")
     logger.info(f"Output format    : {cfg.output_format}")
     logger.info(f"Datasets         : {cfg.datasets}")
-    logger.info(f"Model ID         : {cfg.model_id}")
     if args.force:
         logger.info("Force mode       : ON (ignoring completed stages)")
 
@@ -259,10 +259,11 @@ def main() -> None:
             logger.info(f"  Found {len(pairs)} config/split pair(s)")
 
             for config_name, split in pairs:
+                ccfg = cfg.for_config(config_name)
                 logger.info(f"  ▸ config={config_name!r}  split={split!r}")
 
-                raw_dir, pre_dir, emb_dir, red_dir = create_output_dirs(
-                    base_dir, dataset_name, config_name, split, cfg.model_id
+                raw_dir, pre_dir = create_output_dirs(
+                    base_dir, dataset_name, config_name, split,
                 )
 
                 # ── check resume status ──────────────────────────────
@@ -314,7 +315,7 @@ def main() -> None:
 
                 pipeline.add_stage(
                     ParquetWriter(path=str(pre_dir))
-                    if cfg.output_format == "parquet"
+                    if ccfg.output_format == "parquet"
                     else JsonlWriter(path=str(pre_dir))
                 )
 
@@ -322,7 +323,7 @@ def main() -> None:
                 logger.info(f"    Running pipeline: {pipeline.name}")
                 results = pipeline.run()
 
-                if cfg.output_format == "parquet":
+                if ccfg.output_format == "parquet":
                     canonicalise_parquet_names(pre_dir)
 
                 n_tasks = len(results) if results else 0

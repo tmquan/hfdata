@@ -2,3 +2,11 @@ _base: default.yaml
 
 datasets:
   - th1nhng0/vietnamese-legal-documents
+
+# Per-config overrides (key = HuggingFace config name)
+config_overrides:
+  metadata:
+    skip_embedding: true
+  content:
+    max_seq_length: 8192
+    batch_size: 1
