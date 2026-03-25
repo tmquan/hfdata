@@ -39,7 +39,7 @@ class PipelineConfig:
     output_dir: str = "./datasets"
     cache_dir: str = "~/.cache/huggingface"
     output_format: str = "parquet"
-    model_id: str = "nvidia/llama-embed-nemotron-8b"
+    chunk_size: int = 10000
     config_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @classmethod
@@ -182,16 +182,49 @@ def create_output_dirs(
     return raw_dir, pre_dir
 
 
-def canonicalise_parquet_names(directory: Path) -> int:
-    """Rename ``*.parquet`` files in *directory* to
-    ``part-NNNNNN-of-MMMMMM.parquet`` and return the count."""
-    files = sorted(directory.glob("*.parquet"))
-    total = len(files)
-    for idx, src in enumerate(files, start=1):
-        dst = src.parent / f"part-{idx:06d}-of-{total:06d}.parquet"
-        if src != dst:
-            src.rename(dst)
-    return total
+def rechunk_parquet(directory: Path, chunk_size: int) -> int:
+    """Ensure every parquet in *directory* has at most *chunk_size* rows.
+
+    Idempotent: if all files are already canonical ``part-*`` names with
+    <= *chunk_size* rows, this is a fast no-op.
+    """
+    import pandas as pd
+
+    src_files = sorted(directory.glob("*.parquet"))
+    if not src_files:
+        return 0
+
+    needs_rechunk = False
+    for f in src_files:
+        if not f.name.startswith("part-"):
+            needs_rechunk = True
+            break
+        if pd.read_parquet(f, columns=[]).shape[0] > chunk_size:
+            needs_rechunk = True
+            break
+
+    if not needs_rechunk:
+        return len(src_files)
+
+    logger.info(f"    Rechunking {len(src_files)} file(s) → {chunk_size} rows/chunk …")
+
+    part_idx = 0
+    tmp_parts: list[Path] = []
+    for src in src_files:
+        df = pd.read_parquet(src)
+        for start in range(0, len(df), chunk_size):
+            part_idx += 1
+            tmp = directory / f".tmp_part_{part_idx:06d}.parquet"
+            df.iloc[start : start + chunk_size].to_parquet(tmp, index=False)
+            tmp_parts.append(tmp)
+        src.unlink()
+
+    n_parts = len(tmp_parts)
+    for idx, tmp in enumerate(tmp_parts, start=1):
+        dst = directory / f"part-{idx:06d}-of-{n_parts:06d}.parquet"
+        tmp.rename(dst)
+
+    return n_parts
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -324,7 +357,7 @@ def main() -> None:
                 results = pipeline.run()
 
                 if ccfg.output_format == "parquet":
-                    canonicalise_parquet_names(pre_dir)
+                    rechunk_parquet(pre_dir, ccfg.chunk_size)
 
                 n_tasks = len(results) if results else 0
                 logger.info(

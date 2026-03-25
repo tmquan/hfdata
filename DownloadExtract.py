@@ -252,11 +252,10 @@ def create_output_dirs(
 
 
 def rechunk_parquet(directory: Path, chunk_size: int) -> int:
-    """Split parquet files in *directory* into chunks of at most *chunk_size*
-    rows, then rename everything to ``part-NNNNNN-of-MMMMMM.parquet``.
+    """Ensure every parquet in *directory* has at most *chunk_size* rows.
 
-    This avoids the PyArrow 2 GB ``string`` offset overflow that occurs when
-    a single partition holds too much text data.
+    Idempotent: if all files are already canonical ``part-*`` names with
+    <= *chunk_size* rows, this is a fast no-op.
     """
     import pandas as pd
 
@@ -264,16 +263,20 @@ def rechunk_parquet(directory: Path, chunk_size: int) -> int:
     if not src_files:
         return 0
 
-    total_rows = sum(
-        pd.read_parquet(f, columns=[]).shape[0] for f in src_files
-    )
-    if total_rows <= chunk_size and len(src_files) == 1:
-        # Already small enough — just canonicalise the name
-        n_parts = 1
-        dst = directory / f"part-{1:06d}-of-{n_parts:06d}.parquet"
-        if src_files[0] != dst:
-            src_files[0].rename(dst)
-        return n_parts
+    # Fast path: already correctly chunked?
+    needs_rechunk = False
+    for f in src_files:
+        if not f.name.startswith("part-"):
+            needs_rechunk = True
+            break
+        if pd.read_parquet(f, columns=[]).shape[0] > chunk_size:
+            needs_rechunk = True
+            break
+
+    if not needs_rechunk:
+        return len(src_files)
+
+    logger.info(f"    Rechunking {len(src_files)} file(s) → {chunk_size} rows/chunk …")
 
     part_idx = 0
     tmp_parts: list[Path] = []
@@ -448,6 +451,10 @@ def main() -> None:
                         "output": str(pre_dir),
                     })
                     continue
+
+                # Ensure preprocessed parquets are chunked (idempotent)
+                n_chunks = rechunk_parquet(pre_dir, ccfg.chunk_size)
+                logger.info(f"    preprocessed/ {n_chunks} chunk(s)")
 
                 emb_status, emb_count = check_stage_status(emb_dir)
                 logger.info(
