@@ -10,3 +10,13 @@ output_format: parquet   # or jsonl
 # ─── Model ───────────────────────────────────────────────────────────────────
 model_id:      nvidia/llama-embed-nemotron-8b
 embedding_dim: 4096
+
+# ─── Embedding ───────────────────────────────────────────────────────────────
+embedding_pooling: mean_pooling   # or last_token
+
+# ─── Pipeline ────────────────────────────────────────────────────────────────
+batch_size:          5      # model inference batch size (must fit GPU VRAM)
+num_gpus:            8
+max_seq_length:      32768
+chunk_size:          10000  # records per output parquet partition
+files_per_partition: 1      # NeMo Curator ParquetReader setting

@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
 """HuggingFace dataset downloader — NeMo Curator Pipeline on Ray.
 
+Supports resume: re-running skips already-completed config/split pairs.
+Use ``--force`` to re-download everything.
+
 Usage
 -----
-    # default: download Vietnamese legal documents
     python Download.py
-
-    # pick a config by name (resolves to configs/<name>.yaml)
     python Download.py --config-name vietnamese-legal-documents
-
-    # or give a full path
     python Download.py --config configs/my_dataset.yaml
-
-    # override from CLI
-    python Download.py --datasets org/dataset1 org/dataset2 --output_format jsonl
+    python Download.py --force   # ignore completed stages, re-run all
 """
 
 from __future__ import annotations
@@ -22,6 +18,7 @@ import argparse
 import os
 import sys
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +41,12 @@ class PipelineConfig:
     output_format: str = "parquet"
     model_id: str = "nvidia/llama-embed-nemotron-8b"
     embedding_dim: int = 4096
+    embedding_pooling: str = "mean_pooling"
+    batch_size: int = 8
+    num_gpus: int = 8
+    max_seq_length: int = 32768
+    chunk_size: int = 10000
+    files_per_partition: int = 1
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> PipelineConfig:
@@ -81,10 +84,58 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--output_format", choices=["parquet", "jsonl"], help="Override format",
     )
+    p.add_argument(
+        "--force", action="store_true",
+        help="Re-run all stages even if output already exists",
+    )
     return p.parse_args()
 
 
-# ── Helpers ──────────────────────────────────────────────────────────────────
+# ── Stage status helpers ─────────────────────────────────────────────────────
+
+
+class StageStatus(Enum):
+    MISSING = "missing"
+    PARTIAL = "partial"
+    COMPLETE = "complete"
+
+
+def check_stage_status(directory: Path) -> tuple[StageStatus, int]:
+    """Return ``(status, file_count)`` for a stage output directory.
+
+    - COMPLETE: only canonical ``part-*.parquet`` files, no ``.tmp``
+    - PARTIAL:  has ``.tmp`` or non-canonical ``.parquet`` files (interrupted)
+    - MISSING:  empty or does not exist
+    """
+    if not directory.exists():
+        return StageStatus.MISSING, 0
+
+    tmp_files = list(directory.glob("*.tmp"))
+    canonical = list(directory.glob("part-*.parquet"))
+    other_pq = [
+        f for f in directory.glob("*.parquet")
+        if not f.name.startswith("part-")
+    ]
+
+    if tmp_files or other_pq:
+        return StageStatus.PARTIAL, len(canonical) + len(other_pq)
+    if canonical:
+        return StageStatus.COMPLETE, len(canonical)
+    return StageStatus.MISSING, 0
+
+
+def cleanup_partial(directory: Path) -> None:
+    """Remove ``.tmp`` files and non-canonical parquets from an interrupted run."""
+    for tmp in directory.glob("*.tmp"):
+        tmp.unlink()
+        logger.debug(f"Removed {tmp}")
+    for pq in directory.glob("*.parquet"):
+        if not pq.name.startswith("part-"):
+            pq.unlink()
+            logger.debug(f"Removed {pq}")
+
+
+# ── Other helpers ────────────────────────────────────────────────────────────
 
 
 def enumerate_dataset_splits(dataset_name: str) -> list[tuple[str, str]]:
@@ -123,11 +174,23 @@ def create_output_dirs(
     root = base / dataset_name / config / split
     raw_dir = root / "raw"
     pre_dir = root / "preprocessed"
-    emb_dir = pre_dir / "embeddings" / model_id
-    red_dir = pre_dir / "embreduced" / model_id
+    emb_dir = root / "embeddings" / model_id
+    red_dir = root / "embreduced" / model_id
     for d in (raw_dir, pre_dir, emb_dir, red_dir):
         d.mkdir(parents=True, exist_ok=True)
     return raw_dir, pre_dir, emb_dir, red_dir
+
+
+def canonicalise_parquet_names(directory: Path) -> int:
+    """Rename ``*.parquet`` files in *directory* to
+    ``part-NNNNNN-of-MMMMMM.parquet`` and return the count."""
+    files = sorted(directory.glob("*.parquet"))
+    total = len(files)
+    for idx, src in enumerate(files, start=1):
+        dst = src.parent / f"part-{idx:06d}-of-{total:06d}.parquet"
+        if src != dst:
+            src.rename(dst)
+    return total
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -161,6 +224,8 @@ def main() -> None:
     logger.info(f"Output format    : {cfg.output_format}")
     logger.info(f"Datasets         : {cfg.datasets}")
     logger.info(f"Model ID         : {cfg.model_id}")
+    if args.force:
+        logger.info("Force mode       : ON (ignoring completed stages)")
 
     # ── heavy nemo_curator imports (lazy — only now) ─────────────────────
     os.environ.setdefault("RAPIDS_NO_INITIALIZE", "1")
@@ -200,6 +265,29 @@ def main() -> None:
                     base_dir, dataset_name, config_name, split, cfg.model_id
                 )
 
+                # ── check resume status ──────────────────────────────
+                pre_status, pre_count = check_stage_status(pre_dir)
+                logger.info(
+                    f"    preprocessed/ status={pre_status.value} "
+                    f"({pre_count} file(s))"
+                )
+
+                if pre_status == StageStatus.COMPLETE and not args.force:
+                    logger.info("    SKIP — already complete")
+                    summary.append({
+                        "dataset": dataset_name,
+                        "config": config_name,
+                        "split": split,
+                        "tasks": pre_count,
+                        "output": str(pre_dir),
+                        "status": "skipped",
+                    })
+                    continue
+
+                if pre_status == StageStatus.PARTIAL:
+                    logger.info("    Cleaning up partial run …")
+                    cleanup_partial(pre_dir)
+
                 # ── build pipeline ───────────────────────────────────
                 pipeline = Pipeline(
                     name=(
@@ -234,20 +322,22 @@ def main() -> None:
                 logger.info(f"    Running pipeline: {pipeline.name}")
                 results = pipeline.run()
 
+                if cfg.output_format == "parquet":
+                    canonicalise_parquet_names(pre_dir)
+
                 n_tasks = len(results) if results else 0
                 logger.info(
                     f"    Pipeline completed — {n_tasks} task(s)"
                 )
 
-                summary.append(
-                    {
-                        "dataset": dataset_name,
-                        "config": config_name,
-                        "split": split,
-                        "tasks": n_tasks,
-                        "output": str(pre_dir),
-                    }
-                )
+                summary.append({
+                    "dataset": dataset_name,
+                    "config": config_name,
+                    "split": split,
+                    "tasks": n_tasks,
+                    "output": str(pre_dir),
+                    "status": "ran",
+                })
 
     finally:
         ray_client.stop()
@@ -259,7 +349,8 @@ def main() -> None:
     for entry in summary:
         logger.info(
             f"  {entry['dataset']} / {entry['config']} / {entry['split']}:  "
-            f"{entry['tasks']} task(s)  →  {entry['output']}"
+            f"{entry['tasks']} task(s)  →  {entry['output']}  "
+            f"[{entry['status']}]"
         )
     logger.info(f"{'═' * 60}")
 
