@@ -1,0 +1,12 @@
+# Base configuration — inherited by dataset-specific configs.
+# Override any key in a child YAML that sets  _base: default.yaml
+
+datasets: []
+
+output_dir: ./datasets
+cache_dir: ~/.cache/huggingface
+output_format: parquet   # or jsonl
+
+# ─── Model ───────────────────────────────────────────────────────────────────
+model_id:      nvidia/llama-embed-nemotron-8b
+embedding_dim: 4096

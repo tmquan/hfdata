@@ -1,0 +1,4 @@
+_base: default.yaml
+
+datasets:
+  - th1nhng0/vietnamese-legal-documents
