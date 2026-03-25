@@ -9,6 +9,6 @@ config_overrides:
     skip_embedding: true
     chunk_size: 50000    # keep as single file (518K rows)
   content:
-    max_seq_length: 8192
-    batch_size: 1
+    max_seq_length: 8192 # 32768
+    batch_size: 10
     chunk_size: 50000
