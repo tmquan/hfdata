@@ -331,18 +331,39 @@ class BaseExtractor(_DocumentExtractor):
 
     Override ``_resolve_text_field``, ``_build_id`` or ``_build_output``
     for dataset-specific normalisation.
+
+    When *text_strategy* is not ``"auto"``, the named strategy function
+    from ``Helper.TEXT_STRATEGIES`` is used to construct ``text`` from
+    the raw record, bypassing ``_resolve_text_field``.
     """
 
     def __init__(
         self,
         dataset_name: str = "",
         text_field: str | None = None,
+        text_strategy: str = "auto",
     ) -> None:
         self._dataset_name = dataset_name
         self._text_field = text_field
+        self._text_strategy = text_strategy
         self._resolved_text_field: str | None = None
+        self._strategy_fn = None
+        if text_strategy != "auto":
+            from Helper import TEXT_STRATEGIES
+            self._strategy_fn = TEXT_STRATEGIES.get(text_strategy)
+            if self._strategy_fn is None:
+                logger.warning(
+                    f"Unknown text_strategy {text_strategy!r}, falling back to auto"
+                )
 
     def extract(self, record: dict[str, str]) -> dict[str, Any] | None:
+        if self._strategy_fn is not None:
+            text = self._strategy_fn(record)
+            if not text or not text.strip():
+                return None
+            text = text.strip()
+            return self._build_output(record, text, None)
+
         if self._resolved_text_field is None:
             self._resolved_text_field = self._resolve_text_field(record)
             if self._resolved_text_field:
@@ -389,10 +410,13 @@ class BaseExtractor(_DocumentExtractor):
         self,
         record: dict[str, Any],
         text: str,
-        text_field: str,
+        text_field: str | None,
     ) -> dict[str, Any]:
+        exclude = {"id"}
+        if text_field is not None:
+            exclude.add(text_field)
         metadata = {
-            k: v for k, v in record.items() if k not in {text_field, "id"}
+            k: v for k, v in record.items() if k not in exclude
         }
         return {
             "text": text,

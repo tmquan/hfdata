@@ -1,0 +1,14 @@
+_base: default.yaml
+
+# nvidia/Nemotron-Post-Training-Dataset-v1
+# Schema: messages (list of {role, content} dicts)
+# Subsets: code, math, stem, tool, chat
+
+model_id:      nvidia/llama-embed-nemotron-8b
+embedding_dim: 4096
+max_seq_length: 32768
+text_strategy: messages_list
+batch_size: 1
+
+datasets:
+  - nvidia/Nemotron-Post-Training-Dataset-v1

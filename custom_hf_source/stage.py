@@ -32,6 +32,9 @@ class HuggingFaceDownloadExtractStage(DocumentDownloadExtractStage):
         Directory where raw JSONL files are stored.
     text_field:
         Explicit text column name; ``None`` triggers auto-detection.
+    text_strategy:
+        Named text strategy from ``Helper.TEXT_STRATEGIES``.  ``"auto"``
+        uses the legacy text-field auto-detection.
     url_limit / record_limit:
         Optional caps forwarded to ``DocumentDownloadExtractStage``.
     add_filename_column:
@@ -46,6 +49,7 @@ class HuggingFaceDownloadExtractStage(DocumentDownloadExtractStage):
         cache_dir: str | None = None,
         output_dir: str = "./downloads",
         text_field: str | None = None,
+        text_strategy: str = "auto",
         url_limit: int | None = None,
         record_limit: int | None = None,
         add_filename_column: bool | str = True,
@@ -65,6 +69,7 @@ class HuggingFaceDownloadExtractStage(DocumentDownloadExtractStage):
         extractor = HuggingFaceExtractor(
             dataset_name=dataset_name,
             text_field=text_field,
+            text_strategy=text_strategy,
         )
 
         super().__init__(

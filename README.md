@@ -37,16 +37,20 @@ uv pip install -r requirements.txt
 ```
 hfdata/
 ├── configs/
-│   ├── default.yaml                  # base pipeline configuration
-│   └── vietnamese-legal-documents.yaml  # dataset-specific overrides
-├── custom_hf_source/                 # custom HuggingFace download stage
-├── datasets/                         # output directory (created by pipeline)
-├── Download.py                       # Stage 1: download dataset to parquet
-├── DownloadExtract.py                # Stage 1+2: download + compute embeddings
-├── DownloadExtractReduce.py          # Stage 1+2+3: download + embed + dim-reduce
-├── Helper.py                         # shared utilities and config dataclass
-├── Explorer.ipynb                    # interactive EDA notebook
-├── requirements.txt                  # pinned Python dependencies
+│   ├── default.yaml                       # base pipeline configuration
+│   ├── vietnamese-legal-documents.yaml    # dataset-specific overrides
+│   ├── llama-nemotron-post-training.yaml  # Llama-Nemotron Post-Training
+│   ├── nemotron-post-training-v1.yaml     # Nemotron Post-Training v1
+│   ├── nemotron-post-training-v2.yaml     # Nemotron Post-Training v2
+│   └── nemotron-post-training-v3.yaml     # Nemotron v3 collection (8 datasets)
+├── custom_hf_source/                      # custom HuggingFace download stage
+├── datasets/                              # output directory (created by pipeline)
+├── Download.py                            # Stage 1: download dataset to parquet
+├── DownloadExtract.py                     # Stage 1+2: download + compute embeddings
+├── DownloadExtractReduce.py               # Stage 1+2+3: download + embed + dim-reduce
+├── Helper.py                              # shared utilities, config, text strategies
+├── Explorer.ipynb                         # interactive EDA notebook
+├── requirements.txt                       # pinned Python dependencies
 └── README.md
 ```
 
@@ -78,6 +82,23 @@ python DownloadExtractReduce.py --config-name vietnamese-legal-documents
 python DownloadExtractReduce.py --force   # redo all stages
 ```
 
+#### Nemotron Post-Training Datasets
+
+```bash
+# Llama-Nemotron Post-Training (SFT + RL, messages_concat strategy)
+python DownloadExtractReduce.py --config-name llama-nemotron-post-training
+
+# Nemotron Post-Training v1 (code/math/stem/tool/chat, messages_list strategy)
+python DownloadExtractReduce.py --config-name nemotron-post-training-v1
+
+# Nemotron Post-Training v2 (+ multilingual subsets, messages_list strategy)
+python DownloadExtractReduce.py --config-name nemotron-post-training-v2
+
+# Nemotron v3 collection — 8 datasets with per-dataset text strategies
+# (Science, Agentic, Math-Proofs, Competitive-Programming, SWE, etc.)
+python DownloadExtractReduce.py --config-name nemotron-post-training-v3
+```
+
 All three scripts are **resume-aware** — re-running skips completed stages and
 cleans up partial runs. Pass `--force` to reprocess everything.
 
@@ -103,11 +124,31 @@ child YAML that sets `_base: default.yaml`:
 | `output_dir`       | `./datasets`                       | Root output directory                    |
 | `model_id`         | `nvidia/llama-embed-nemotron-8b`   | Embedding model                          |
 | `embedding_dim`    | `4096`                             | Model embedding dimension                |
+| `text_strategy`    | `auto`                             | Text extraction strategy (see below)     |
 | `batch_size`       | `1`                                | Inference batch size (must fit GPU VRAM)  |
 | `num_gpus`         | `8`                                | Number of GPUs for Ray pipeline          |
 | `max_seq_length`   | `8192`                             | Max input tokens                         |
 | `reduce_methods`   | `[pca, tsne, umap]`               | Dimensionality reduction algorithms      |
 | `reduce_n_components` | `2`                             | Target dimensions (2D)                   |
+| `config_overrides` | `{}`                               | Per-HF-config overrides (keyed by config name) |
+| `dataset_overrides`| `{}`                               | Per-dataset overrides (keyed by HF repo id) |
+
+### Text Strategies
+
+The `text_strategy` field controls how raw HuggingFace records are converted
+into a single `text` column for embedding:
+
+| Strategy           | Description                                                  |
+| ------------------ | ------------------------------------------------------------ |
+| `auto`             | Legacy auto-detection: pick first string column > 20 chars   |
+| `smart`            | Column-aware dispatch: infers strategy from available fields  |
+| `messages_list`    | Flatten `messages` list of `{role, content}` dicts           |
+| `messages_concat`  | Flatten `input` messages + append `output` string            |
+| `rl_blend`         | Extract from `responses_create_params.input` + `ground_truth`|
+| `agentic`          | Serialize `tools` definitions + flatten `messages`           |
+| `math_proof`       | Concatenate `problem` + Lean 4 `formal_statement`           |
+| `math_v2`          | Flatten `messages`, fallback to `problem` field              |
+| `raw_text`         | Use the `text` column directly                               |
 
 ## License
 

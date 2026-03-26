@@ -13,4 +13,20 @@ from .base import BaseExtractor
 
 
 class HuggingFaceExtractor(BaseExtractor):
-    """Ready-to-use extractor with text-field auto-detection."""
+    """Ready-to-use extractor with text-field auto-detection.
+
+    Pass *text_strategy* to use a named strategy function from
+    ``Helper.TEXT_STRATEGIES`` instead of auto-detecting a text field.
+    """
+
+    def __init__(
+        self,
+        dataset_name: str = "",
+        text_field: str | None = None,
+        text_strategy: str = "auto",
+    ) -> None:
+        super().__init__(
+            dataset_name=dataset_name,
+            text_field=text_field,
+            text_strategy=text_strategy,
+        )

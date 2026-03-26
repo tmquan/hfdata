@@ -362,8 +362,10 @@ def main() -> None:
 
             logger.info(f"  Found {len(pairs)} config/split pair(s)")
 
+            dcfg = cfg.for_dataset(dataset_name)
+
             for config_name, split in pairs:
-                ccfg = cfg.for_config(config_name)
+                ccfg = dcfg.for_config(config_name)
                 logger.info(
                     f"  ▸ config={config_name!r}  split={split!r}  "
                     f"(batch_size={ccfg.batch_size}, "
@@ -409,6 +411,7 @@ def main() -> None:
                             config_name=config_name,
                             cache_dir=cache_dir,
                             output_dir=str(raw_dir),
+                            text_strategy=ccfg.text_strategy,
                         )
                     )
 

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import dataclasses
+import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -36,9 +38,11 @@ class PipelineConfig:
     max_seq_length: int = 32768
     files_per_partition: int = 1
     skip_embedding: bool = False
+    text_strategy: str = "auto"
     reduce_methods: list[str] = field(default_factory=lambda: ["pca", "tsne", "umap"])
     reduce_n_components: int = 2
     config_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
+    dataset_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> PipelineConfig:
@@ -59,6 +63,14 @@ class PipelineConfig:
         known = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
         return cls(**known)
 
+    def for_dataset(self, dataset_name: str) -> PipelineConfig:
+        """Return a copy with per-dataset overrides applied."""
+        overrides = self.dataset_overrides.get(dataset_name, {})
+        if not overrides:
+            return self
+        vals = {k: v for k, v in overrides.items() if k in self.__dataclass_fields__}
+        return dataclasses.replace(self, **vals)
+
     def for_config(self, config_name: str) -> PipelineConfig:
         """Return a copy with per-config overrides applied."""
         overrides = self.config_overrides.get(config_name, {})
@@ -66,6 +78,248 @@ class PipelineConfig:
             return self
         vals = {k: v for k, v in overrides.items() if k in self.__dataclass_fields__}
         return dataclasses.replace(self, **vals)
+
+
+# ── Text strategy registry ───────────────────────────────────────────────────
+
+
+def _flatten_messages(messages: list[dict[str, Any]]) -> str:
+    """Convert ``[{role, content}, ...]`` into ``"Role: content\\n..."``.
+
+    Handles nested content (list-of-dicts), ``tool_calls`` structs, and
+    content that is ``None`` (common in tool-call turns).
+    """
+    parts: list[str] = []
+    for msg in messages:
+        role = str(msg.get("role", "unknown")).capitalize()
+        content = msg.get("content")
+
+        if content is None:
+            content = ""
+        elif isinstance(content, list):
+            content = " ".join(
+                str(c.get("text", c)) if isinstance(c, dict) else str(c)
+                for c in content
+            )
+        else:
+            content = str(content)
+
+        tool_calls = msg.get("tool_calls")
+        if tool_calls and isinstance(tool_calls, list):
+            tc_parts = []
+            for tc in tool_calls:
+                fn = tc.get("function", tc) if isinstance(tc, dict) else tc
+                if isinstance(fn, dict):
+                    name = fn.get("name", "")
+                    args = fn.get("arguments", "")
+                    if isinstance(args, dict):
+                        args = json.dumps(args, ensure_ascii=False, default=str)
+                    tc_parts.append(f"{name}({args})" if name else str(fn))
+                else:
+                    tc_parts.append(str(fn))
+            if tc_parts:
+                content = f"{content}\n[tool_calls: {', '.join(tc_parts)}]" if content else f"[tool_calls: {', '.join(tc_parts)}]"
+
+        parts.append(f"{role}: {content}")
+    return "\n".join(parts)
+
+
+def _serialize_tools(tools: list[dict[str, Any]]) -> str:
+    """Compact text summary of tool/function definitions."""
+    parts: list[str] = []
+    for tool in tools:
+        fn = tool.get("function", tool)
+        if not isinstance(fn, dict):
+            parts.append(f"Tool: {fn}")
+            continue
+        name = fn.get("name", "unknown")
+        desc = fn.get("description", "")
+        parts.append(f"Tool: {name} - {desc}" if desc else f"Tool: {name}")
+    return "\n".join(parts)
+
+
+def _strategy_messages_list(record: dict[str, Any]) -> str | None:
+    """Flatten the ``messages`` column (list of role/content dicts).
+
+    Handles tool_calls in message turns (Nemotron-Post-Training v1 tool
+    subset) and skips the ``metadata`` column (JSON string) automatically.
+    """
+    messages = record.get("messages")
+    if not messages or not isinstance(messages, list):
+        return None
+    return _flatten_messages(messages)
+
+
+def _strategy_messages_concat(record: dict[str, Any]) -> str | None:
+    """Flatten ``input`` message list and append ``output``.
+
+    Used by Llama-Nemotron-Post-Training-Dataset:
+    - SFT subsets: ``input`` (list of messages) + ``output`` (string)
+    - RL/when2call subsets: ``messages`` (list) — auto-detected as fallback
+
+    Strips ``system_prompt`` if it duplicates the first system message.
+    """
+    inp = record.get("input")
+    if isinstance(inp, list):
+        sys_prompt = record.get("system_prompt", "")
+        if (
+            sys_prompt
+            and inp
+            and isinstance(inp[0], dict)
+            and inp[0].get("role") == "system"
+            and str(inp[0].get("content", "")).strip() == str(sys_prompt).strip()
+        ):
+            pass
+        elif sys_prompt:
+            inp = [{"role": "system", "content": sys_prompt}] + list(inp)
+
+        text = _flatten_messages(inp)
+        output = record.get("output", "")
+        if output:
+            text += f"\nAssistant: {output}"
+        return text
+
+    messages = record.get("messages")
+    if isinstance(messages, list):
+        return _flatten_messages(messages)
+    return None
+
+
+def _strategy_rl_blend(record: dict[str, Any]) -> str | None:
+    """Extract messages from ``responses_create_params.input`` + ground_truth.
+
+    Used by Nemotron-3-Nano-RL-Training-Blend. The nested dict structure:
+    ``responses_create_params["input"]`` contains the message list.
+    ``ground_truth`` is a list of tool-call dicts appended as structured text.
+    """
+    rcp = record.get("responses_create_params")
+    if isinstance(rcp, str):
+        try:
+            rcp = json.loads(rcp)
+        except (json.JSONDecodeError, TypeError):
+            rcp = None
+    if isinstance(rcp, dict):
+        messages = rcp.get("input")
+        if isinstance(messages, list):
+            text = _flatten_messages(messages)
+            gt = record.get("ground_truth")
+            if gt:
+                if isinstance(gt, str):
+                    text += f"\nGround truth: {gt}"
+                else:
+                    text += f"\nGround truth: {json.dumps(gt, ensure_ascii=False, default=str)}"
+            return text
+    return _strategy_messages_list(record)
+
+
+def _strategy_agentic(record: dict[str, Any]) -> str | None:
+    """Serialize tool definitions as prefix, then flatten messages.
+
+    Used by Nemotron-Agentic-v1 and Nemotron-SWE-v1. Captures the full
+    agentic task structure: available tools + multi-turn conversation
+    including tool calls and tool outputs.
+
+    WARNING: SWE-v1 messages can exceed 100k chars. The embedding model's
+    tokenizer will truncate to ``max_seq_length``.
+    """
+    sections: list[str] = []
+    tools = record.get("tools")
+    if isinstance(tools, list) and tools:
+        sections.append(_serialize_tools(tools))
+    messages = record.get("messages")
+    if isinstance(messages, list):
+        sections.append(_flatten_messages(messages))
+    return "\n\n".join(sections) if sections else None
+
+
+def _strategy_math_proof(record: dict[str, Any]) -> str | None:
+    """Concatenate ``problem`` + Lean 4 ``formal_statement``.
+
+    Used by Nemotron-Math-Proofs-v1. Falls back to ``messages`` if the
+    primary fields are empty (some rows have ``messages`` populated instead).
+    Skips None-valued fields (url, user_name, sft_line_number).
+    """
+    problem = str(record.get("problem", "") or "").strip()
+    header = str(record.get("lean_header", "") or "").strip()
+    formal = str(record.get("formal_statement", "") or "").strip()
+    if not problem and not formal:
+        return _strategy_messages_list(record)
+    parts = []
+    if problem:
+        parts.append(f"Problem: {problem}")
+    if header or formal:
+        parts.append("Formal Statement (Lean 4):")
+        if header:
+            parts.append(header)
+        if formal:
+            parts.append(formal)
+    return "\n\n".join(parts)
+
+
+def _strategy_math_v2(record: dict[str, Any]) -> str | None:
+    """Flatten ``messages`` if present, else fall back to ``problem``.
+
+    Used by Nemotron-Math-v2 (low/medium/high difficulty tiers).
+    Messages typically contain the user prompt with \\\\boxed{} instruction
+    and the assistant solution.
+    """
+    messages = record.get("messages")
+    if isinstance(messages, list) and messages:
+        return _flatten_messages(messages)
+    problem = str(record.get("problem", "") or "").strip()
+    return problem if problem else None
+
+
+def _strategy_raw_text(record: dict[str, Any]) -> str | None:
+    """Use the ``text`` field directly.
+
+    Used by pretraining datasets where the text column already contains
+    the full document. Skips records with no ``text`` column (e.g.
+    Code-Metadata subset which only has repo/commit_id/rel_path).
+    """
+    text = record.get("text")
+    if text is None:
+        return None
+    text = str(text).strip()
+    return text if text else None
+
+
+def _strategy_auto_detect(record: dict[str, Any]) -> str | None:
+    """Smart auto-detection: infer the best strategy from available columns.
+
+    Checks for common column patterns across Nemotron datasets and
+    dispatches to the appropriate strategy function.
+    """
+    keys = set(record.keys())
+
+    if "responses_create_params" in keys:
+        return _strategy_rl_blend(record)
+    if "tools" in keys and "messages" in keys:
+        return _strategy_agentic(record)
+    if "formal_statement" in keys or "lean_header" in keys:
+        return _strategy_math_proof(record)
+    if "input" in keys and isinstance(record["input"], list):
+        return _strategy_messages_concat(record)
+    if "messages" in keys and isinstance(record["messages"], list):
+        return _strategy_messages_list(record)
+    if "problem" in keys:
+        return _strategy_math_v2(record)
+    if "text" in keys:
+        return _strategy_raw_text(record)
+    return None
+
+
+TEXT_STRATEGIES: dict[str, Callable[[dict[str, Any]], str | None] | None] = {
+    "auto": None,
+    "smart": _strategy_auto_detect,
+    "messages_list": _strategy_messages_list,
+    "messages_concat": _strategy_messages_concat,
+    "rl_blend": _strategy_rl_blend,
+    "agentic": _strategy_agentic,
+    "math_proof": _strategy_math_proof,
+    "math_v2": _strategy_math_v2,
+    "raw_text": _strategy_raw_text,
+}
 
 
 # ── Stage status ─────────────────────────────────────────────────────────────

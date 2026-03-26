@@ -1,0 +1,34 @@
+_base: default.yaml
+
+# Nemotron v3 post-training collection
+# Each dataset has a different schema requiring its own text strategy.
+# Per-dataset overrides select the appropriate extraction function.
+
+model_id:      nvidia/llama-embed-nemotron-8b
+embedding_dim: 4096
+max_seq_length: 32768
+text_strategy: messages_list
+batch_size: 1
+
+datasets:
+  - nvidia/Nemotron-3-Nano-RL-Training-Blend
+  - nvidia/Nemotron-Science-v1
+  - nvidia/Nemotron-Instruction-Following-Chat-v1
+  - nvidia/Nemotron-Math-Proofs-v1
+  - nvidia/Nemotron-Agentic-v1
+  - nvidia/Nemotron-Competitive-Programming-v1
+  - nvidia/Nemotron-Math-v2
+  - nvidia/Nemotron-SWE-v1
+
+dataset_overrides:
+  nvidia/Nemotron-3-Nano-RL-Training-Blend:
+    text_strategy: rl_blend
+  nvidia/Nemotron-Math-Proofs-v1:
+    text_strategy: math_proof
+  nvidia/Nemotron-Agentic-v1:
+    text_strategy: agentic
+  nvidia/Nemotron-Math-v2:
+    text_strategy: math_v2
+  nvidia/Nemotron-SWE-v1:
+    text_strategy: agentic
+    max_seq_length: 32768

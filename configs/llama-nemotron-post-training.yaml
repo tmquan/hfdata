@@ -1,0 +1,18 @@
+_base: default.yaml
+
+# nvidia/Llama-Nemotron-Post-Training-Dataset
+# Schema: input (list of messages) + output (string), or messages (list)
+# Strategy: messages_concat flattens input messages and appends output
+
+model_id:      nvidia/llama-embed-nemotron-8b
+embedding_dim: 4096
+max_seq_length: 32768
+text_strategy: messages_concat
+batch_size: 1
+
+datasets:
+  - nvidia/Llama-Nemotron-Post-Training-Dataset
+
+config_overrides:
+  train:
+    text_strategy: messages_list

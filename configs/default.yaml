@@ -15,6 +15,9 @@ output_format: parquet   # or jsonl
 model_id:      GreenNode/GreenNode-Embedding-Large-VN-Mixed-V1
 embedding_dim: 1024
 
+# ─── Text extraction ─────────────────────────────────────────────────────────
+text_strategy: auto   # auto | smart | messages_list | messages_concat | rl_blend | agentic | math_proof | math_v2 | raw_text
+
 # ─── Embedding ───────────────────────────────────────────────────────────────
 embedding_pooling: mean_pooling   # or last_token
 
