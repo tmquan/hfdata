@@ -111,6 +111,7 @@ jiter==0.13.0
 jmespath==1.1.0
 joblib==1.5.3
 jsonschema==4.26.0
+kaleido==1.2.0
 jsonschema-specifications==2025.9.1
 jupyter_client==8.8.0
 jupyter_core==5.9.1
