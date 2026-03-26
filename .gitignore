@@ -1,5 +1,7 @@
 datasets/*
 .cache/*
+figures/*
+Explorer.ipynb
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
