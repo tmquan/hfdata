@@ -10,5 +10,5 @@ config_overrides:
     chunk_size: 50000    # keep as single file (518K rows)
   content:
     max_seq_length: 8192 # 32768
-    batch_size: 10
+    batch_size: 5
     chunk_size: 50000

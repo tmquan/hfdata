@@ -4,8 +4,8 @@
 Pipeline 1 (download):  HuggingFaceDownloadExtractStage -> ParquetWriter
 Pipeline 2 (embed):     ParquetReader -> EmbeddingCreatorStage -> ParquetWriter
 
-Supports resume: re-running skips already-completed stages per config/split.
-Use ``--force`` to re-run everything.
+Resume-aware: re-running skips completed stages, cleans up partial runs.
+Use ``--force`` to redo all.
 
 Usage
 -----
@@ -21,16 +21,23 @@ import argparse
 import importlib.util
 import os
 import sys
-from dataclasses import dataclass, field
-from enum import Enum
 from pathlib import Path
 from typing import Any
 
-import yaml
 from huggingface_hub import snapshot_download
 from loguru import logger
 
 from custom_hf_source import HuggingFaceDownloadExtractStage
+from Helper import (
+    PipelineConfig,
+    StageStatus,
+    check_stage_status,
+    cleanup_partial,
+    cleanup_raw_temps,
+    create_output_dirs,
+    enumerate_dataset_splits,
+    rechunk_parquet,
+)
 
 
 # ── Library patches ──────────────────────────────────────────────────────────
@@ -39,7 +46,12 @@ _LIBRARY_PATCHES: list[tuple[str, str, str]] = [
     (
         "nemo_curator.stages.text.embedders.base",
         "AutoModel.from_pretrained(self.model_identifier, cache_dir=self.cache_dir, local_files_only=True)",
-        "AutoModel.from_pretrained(self.model_identifier, cache_dir=self.cache_dir, local_files_only=True, trust_remote_code=True)",
+        "AutoModel.from_pretrained(self.model_identifier, cache_dir=self.cache_dir, local_files_only=True, trust_remote_code=True, attn_implementation='eager')",
+    ),
+    (
+        "nemo_curator.stages.text.embedders.base",
+        "local_files_only=True, trust_remote_code=True)",
+        "local_files_only=True, trust_remote_code=True, attn_implementation='eager')",
     ),
     (
         "nemo_curator.stages.text.models.tokenizer",
@@ -87,55 +99,7 @@ def _ensure_model_cached(model_id: str) -> None:
     logger.info("Model cache ready.")
 
 
-# ── Configuration ────────────────────────────────────────────────────────────
-
-
-@dataclass
-class PipelineConfig:
-    """Typed mirror of ``configs/default.yaml``."""
-
-    datasets: list[str] = field(default_factory=list)
-    output_dir: str = "./datasets"
-    cache_dir: str = "~/.cache/huggingface"
-    output_format: str = "parquet"
-    model_id: str = "nvidia/llama-embed-nemotron-8b"
-    embedding_dim: int = 4096
-    embedding_pooling: str = "mean_pooling"
-    batch_size: int = 8
-    num_gpus: int = 8
-    max_seq_length: int = 32768
-    chunk_size: int = 10000
-    files_per_partition: int = 1
-    skip_embedding: bool = False
-    config_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
-
-    @classmethod
-    def from_yaml(cls, path: str | Path) -> PipelineConfig:
-        """Load config with ``_base`` inheritance."""
-        path = Path(path)
-        with open(path) as fh:
-            child = yaml.safe_load(fh) or {}
-
-        base_name = child.pop("_base", None)
-        if base_name is not None:
-            base_path = path.parent / base_name
-            with open(base_path) as fh:
-                data = yaml.safe_load(fh) or {}
-            data.update({k: v for k, v in child.items() if v is not None})
-        else:
-            data = child
-
-        known = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
-        return cls(**known)
-
-    def for_config(self, config_name: str) -> PipelineConfig:
-        """Return a copy with per-config overrides applied."""
-        overrides = self.config_overrides.get(config_name, {})
-        if not overrides:
-            return self
-        import dataclasses
-        vals = {k: overrides[k] for k in overrides if k in self.__dataclass_fields__}
-        return dataclasses.replace(self, **vals)
+# ── CLI ──────────────────────────────────────────────────────────────────────
 
 
 def parse_args() -> argparse.Namespace:
@@ -159,142 +123,6 @@ def parse_args() -> argparse.Namespace:
         help="Re-run all stages even if output already exists",
     )
     return p.parse_args()
-
-
-# ── Stage status helpers ─────────────────────────────────────────────────────
-
-
-class StageStatus(Enum):
-    MISSING = "missing"
-    PARTIAL = "partial"
-    COMPLETE = "complete"
-
-
-def check_stage_status(directory: Path) -> tuple[StageStatus, int]:
-    """Return ``(status, file_count)`` for a stage output directory.
-
-    - COMPLETE: only canonical ``part-*.parquet`` files, no ``.tmp``
-    - PARTIAL:  has ``.tmp`` or non-canonical ``.parquet`` files (interrupted)
-    - MISSING:  empty or does not exist
-    """
-    if not directory.exists():
-        return StageStatus.MISSING, 0
-
-    tmp_files = list(directory.glob("*.tmp"))
-    canonical = list(directory.glob("part-*.parquet"))
-    other_pq = [
-        f for f in directory.glob("*.parquet")
-        if not f.name.startswith("part-")
-    ]
-
-    if tmp_files or other_pq:
-        return StageStatus.PARTIAL, len(canonical) + len(other_pq)
-    if canonical:
-        return StageStatus.COMPLETE, len(canonical)
-    return StageStatus.MISSING, 0
-
-
-def cleanup_partial(directory: Path) -> None:
-    """Remove ``.tmp`` files and non-canonical parquets from an interrupted run."""
-    for tmp in directory.glob("*.tmp"):
-        tmp.unlink()
-        logger.debug(f"Removed {tmp}")
-    for pq in directory.glob("*.parquet"):
-        if not pq.name.startswith("part-"):
-            pq.unlink()
-            logger.debug(f"Removed {pq}")
-
-
-# ── Other helpers ────────────────────────────────────────────────────────────
-
-
-def enumerate_dataset_splits(dataset_name: str) -> list[tuple[str, str]]:
-    """Return every ``(config, split)`` pair for *dataset_name* via HF Hub."""
-    from datasets import get_dataset_config_names, get_dataset_split_names
-
-    try:
-        configs = get_dataset_config_names(dataset_name, trust_remote_code=True)
-    except Exception:
-        configs = []
-    if not configs:
-        configs = ["default"]
-
-    pairs: list[tuple[str, str]] = []
-    for cfg in configs:
-        try:
-            splits = get_dataset_split_names(
-                dataset_name, cfg, trust_remote_code=True
-            )
-        except Exception:
-            try:
-                splits = get_dataset_split_names(
-                    dataset_name, trust_remote_code=True
-                )
-            except Exception:
-                splits = ["train"]
-        for sp in splits:
-            pairs.append((cfg, sp))
-    return pairs
-
-
-def create_output_dirs(
-    base: Path, dataset_name: str, config: str, split: str, model_id: str,
-) -> tuple[Path, Path, Path, Path]:
-    """Create and return ``(raw, preprocessed, embeddings, embreduced)``."""
-    root = base / dataset_name / config / split
-    raw_dir = root / "raw"
-    pre_dir = root / "preprocessed"
-    emb_dir = root / "embeddings" / model_id
-    red_dir = root / "embreduced" / model_id
-    for d in (raw_dir, pre_dir, emb_dir, red_dir):
-        d.mkdir(parents=True, exist_ok=True)
-    return raw_dir, pre_dir, emb_dir, red_dir
-
-
-def rechunk_parquet(directory: Path, chunk_size: int) -> int:
-    """Ensure every parquet in *directory* has at most *chunk_size* rows.
-
-    Idempotent: if all files are already canonical ``part-*`` names with
-    <= *chunk_size* rows, this is a fast no-op.
-    """
-    import pandas as pd
-
-    src_files = sorted(directory.glob("*.parquet"))
-    if not src_files:
-        return 0
-
-    # Fast path: already correctly chunked?
-    needs_rechunk = False
-    for f in src_files:
-        if not f.name.startswith("part-"):
-            needs_rechunk = True
-            break
-        if pd.read_parquet(f, columns=[]).shape[0] > chunk_size:
-            needs_rechunk = True
-            break
-
-    if not needs_rechunk:
-        return len(src_files)
-
-    logger.info(f"    Rechunking {len(src_files)} file(s) → {chunk_size} rows/chunk …")
-
-    part_idx = 0
-    tmp_parts: list[Path] = []
-    for src in src_files:
-        df = pd.read_parquet(src)
-        for start in range(0, len(df), chunk_size):
-            part_idx += 1
-            tmp = directory / f".tmp_part_{part_idx:06d}.parquet"
-            df.iloc[start : start + chunk_size].to_parquet(tmp, index=False)
-            tmp_parts.append(tmp)
-        src.unlink()
-
-    n_parts = len(tmp_parts)
-    for idx, tmp in enumerate(tmp_parts, start=1):
-        dst = directory / f"part-{idx:06d}-of-{n_parts:06d}.parquet"
-        tmp.rename(dst)
-
-    return n_parts
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -334,11 +162,12 @@ def main() -> None:
     logger.info(f"Num GPUs         : {cfg.num_gpus}")
     logger.info(f"Chunk size       : {cfg.chunk_size}")
     if args.force:
-        logger.info("Force mode       : ON (ignoring completed stages)")
+        logger.info("Force mode       : ON")
 
-    # ── heavy nemo_curator imports (lazy — only now) ─────────────────────
+    # ── environment guards ───────────────────────────────────────────────
     os.environ.setdefault("RAPIDS_NO_INITIALIZE", "1")
     os.environ.setdefault("CUDF_SPILL", "off")
+    os.environ.setdefault("TORCH_CUDNN_V8_API_DISABLED", "1")
 
     _patch_nemo_curator_library()
     _ensure_model_cached(cfg.model_id)
@@ -384,10 +213,12 @@ def main() -> None:
                     base_dir, dataset_name, config_name, split, ccfg.model_id
                 )
 
+                cleanup_raw_temps(raw_dir)
+
                 # ── Pipeline 1: download + extract ───────────────────
                 pre_status, pre_count = check_stage_status(pre_dir)
                 logger.info(
-                    f"    preprocessed/ status={pre_status.value} "
+                    f"    preprocessed/ {pre_status.value} "
                     f"({pre_count} file(s))"
                 )
 
@@ -446,19 +277,21 @@ def main() -> None:
                         "split": split,
                         "dl_tasks": dl_tasks,
                         "emb_tasks": 0,
-                        "dl_status": "skipped" if pre_status == StageStatus.COMPLETE and not args.force else "ran",
+                        "dl_status": (
+                            "skipped" if pre_status == StageStatus.COMPLETE
+                            and not args.force else "ran"
+                        ),
                         "emb_status": "skip_embedding",
                         "output": str(pre_dir),
                     })
                     continue
 
-                # Ensure preprocessed parquets are chunked (idempotent)
                 n_chunks = rechunk_parquet(pre_dir, ccfg.chunk_size)
                 logger.info(f"    preprocessed/ {n_chunks} chunk(s)")
 
                 emb_status, emb_count = check_stage_status(emb_dir)
                 logger.info(
-                    f"    embeddings/   status={emb_status.value} "
+                    f"    embeddings/   {emb_status.value} "
                     f"({emb_count} file(s))"
                 )
 

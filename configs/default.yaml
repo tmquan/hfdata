@@ -10,6 +10,8 @@ output_format: parquet   # or jsonl
 # ─── Model ───────────────────────────────────────────────────────────────────
 model_id:      nvidia/llama-embed-nemotron-8b
 embedding_dim: 4096
+# model_id:      nvidia/llama-nemotron-embed-1b-v2
+# embedding_dim: 2048
 
 # ─── Embedding ───────────────────────────────────────────────────────────────
 embedding_pooling: mean_pooling   # or last_token
@@ -20,3 +22,7 @@ num_gpus:            8
 max_seq_length:      8192
 chunk_size:          50000  # records per output parquet partition
 files_per_partition: 1      # NeMo Curator ParquetReader setting
+
+# ─── Reduction ───────────────────────────────────────────────────────────────
+reduce_methods: [pca, tsne, umap]   # which methods to run
+reduce_n_components: 2              # 2 only; 3 → NotImplementedError

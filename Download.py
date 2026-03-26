@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """HuggingFace dataset downloader — NeMo Curator Pipeline on Ray.
 
-Supports resume: re-running skips already-completed config/split pairs.
-Use ``--force`` to re-download everything.
+Resume-aware: re-running skips completed config/split pairs, cleans up
+partial runs, and picks up where it left off.  Use ``--force`` to redo all.
 
 Usage
 -----
     python Download.py
     python Download.py --config-name vietnamese-legal-documents
     python Download.py --config configs/my_dataset.yaml
-    python Download.py --force   # ignore completed stages, re-run all
+    python Download.py --force
 """
 
 from __future__ import annotations
@@ -17,58 +17,22 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from dataclasses import dataclass, field
-from enum import Enum
 from pathlib import Path
 from typing import Any
 
-import yaml
 from loguru import logger
 
 from custom_hf_source import HuggingFaceDownloadExtractStage
-
-
-# ── Configuration ────────────────────────────────────────────────────────────
-
-
-@dataclass
-class PipelineConfig:
-    """Typed mirror of ``configs/default.yaml``."""
-
-    datasets: list[str] = field(default_factory=list)
-    output_dir: str = "./datasets"
-    cache_dir: str = "~/.cache/huggingface"
-    output_format: str = "parquet"
-    chunk_size: int = 10000
-    config_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
-
-    @classmethod
-    def from_yaml(cls, path: str | Path) -> PipelineConfig:
-        """Load config with ``_base`` inheritance."""
-        path = Path(path)
-        with open(path) as fh:
-            child = yaml.safe_load(fh) or {}
-
-        base_name = child.pop("_base", None)
-        if base_name is not None:
-            base_path = path.parent / base_name
-            with open(base_path) as fh:
-                data = yaml.safe_load(fh) or {}
-            data.update({k: v for k, v in child.items() if v is not None})
-        else:
-            data = child
-
-        known = {k: v for k, v in data.items() if k in cls.__dataclass_fields__}
-        return cls(**known)
-
-    def for_config(self, config_name: str) -> PipelineConfig:
-        """Return a copy with per-config overrides applied."""
-        overrides = self.config_overrides.get(config_name, {})
-        if not overrides:
-            return self
-        import dataclasses
-        vals = {k: v for k, v in overrides.items() if k in self.__dataclass_fields__}
-        return dataclasses.replace(self, **vals)
+from Helper import (
+    PipelineConfig,
+    StageStatus,
+    check_stage_status,
+    cleanup_partial,
+    cleanup_raw_temps,
+    create_output_dirs,
+    enumerate_dataset_splits,
+    rechunk_parquet,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -92,142 +56,6 @@ def parse_args() -> argparse.Namespace:
         help="Re-run all stages even if output already exists",
     )
     return p.parse_args()
-
-
-# ── Stage status helpers ─────────────────────────────────────────────────────
-
-
-class StageStatus(Enum):
-    MISSING = "missing"
-    PARTIAL = "partial"
-    COMPLETE = "complete"
-
-
-def check_stage_status(directory: Path) -> tuple[StageStatus, int]:
-    """Return ``(status, file_count)`` for a stage output directory.
-
-    - COMPLETE: only canonical ``part-*.parquet`` files, no ``.tmp``
-    - PARTIAL:  has ``.tmp`` or non-canonical ``.parquet`` files (interrupted)
-    - MISSING:  empty or does not exist
-    """
-    if not directory.exists():
-        return StageStatus.MISSING, 0
-
-    tmp_files = list(directory.glob("*.tmp"))
-    canonical = list(directory.glob("part-*.parquet"))
-    other_pq = [
-        f for f in directory.glob("*.parquet")
-        if not f.name.startswith("part-")
-    ]
-
-    if tmp_files or other_pq:
-        return StageStatus.PARTIAL, len(canonical) + len(other_pq)
-    if canonical:
-        return StageStatus.COMPLETE, len(canonical)
-    return StageStatus.MISSING, 0
-
-
-def cleanup_partial(directory: Path) -> None:
-    """Remove ``.tmp`` files and non-canonical parquets from an interrupted run."""
-    for tmp in directory.glob("*.tmp"):
-        tmp.unlink()
-        logger.debug(f"Removed {tmp}")
-    for pq in directory.glob("*.parquet"):
-        if not pq.name.startswith("part-"):
-            pq.unlink()
-            logger.debug(f"Removed {pq}")
-
-
-# ── Other helpers ────────────────────────────────────────────────────────────
-
-
-def enumerate_dataset_splits(dataset_name: str) -> list[tuple[str, str]]:
-    """Return every ``(config, split)`` pair for *dataset_name* via HF Hub."""
-    from datasets import get_dataset_config_names, get_dataset_split_names
-
-    try:
-        configs = get_dataset_config_names(dataset_name, trust_remote_code=True)
-    except Exception:
-        configs = []
-    if not configs:
-        configs = ["default"]
-
-    pairs: list[tuple[str, str]] = []
-    for cfg in configs:
-        try:
-            splits = get_dataset_split_names(
-                dataset_name, cfg, trust_remote_code=True
-            )
-        except Exception:
-            try:
-                splits = get_dataset_split_names(
-                    dataset_name, trust_remote_code=True
-                )
-            except Exception:
-                splits = ["train"]
-        for sp in splits:
-            pairs.append((cfg, sp))
-    return pairs
-
-
-def create_output_dirs(
-    base: Path, dataset_name: str, config: str, split: str,
-) -> tuple[Path, Path]:
-    """Create and return ``(raw, preprocessed)``."""
-    root = base / dataset_name / config / split
-    raw_dir = root / "raw"
-    pre_dir = root / "preprocessed"
-    for d in (raw_dir, pre_dir):
-        d.mkdir(parents=True, exist_ok=True)
-    return raw_dir, pre_dir
-
-
-def rechunk_parquet(directory: Path, chunk_size: int) -> int:
-    """Ensure every parquet in *directory* has at most *chunk_size* rows.
-
-    Idempotent: if all files are already canonical ``part-*`` names with
-    <= *chunk_size* rows, this is a fast no-op.
-    """
-    import pandas as pd
-
-    src_files = sorted(directory.glob("*.parquet"))
-    if not src_files:
-        return 0
-
-    needs_rechunk = False
-    for f in src_files:
-        if not f.name.startswith("part-"):
-            needs_rechunk = True
-            break
-        if pd.read_parquet(f, columns=[]).shape[0] > chunk_size:
-            needs_rechunk = True
-            break
-
-    if not needs_rechunk:
-        return len(src_files)
-
-    logger.info(f"    Rechunking {len(src_files)} file(s) → {chunk_size} rows/chunk …")
-
-    part_idx = 0
-    tmp_parts: list[Path] = []
-    for src in src_files:
-        df = pd.read_parquet(src)
-        for start in range(0, len(df), chunk_size):
-            part_idx += 1
-            tmp = directory / f".tmp_part_{part_idx:06d}.parquet"
-            df.iloc[start : start + chunk_size].to_parquet(tmp, index=False)
-            tmp_parts.append(tmp)
-        src.unlink()
-
-    n_parts = len(tmp_parts)
-    for idx, tmp in enumerate(tmp_parts, start=1):
-        dst = directory / f"part-{idx:06d}-of-{n_parts:06d}.parquet"
-        tmp.rename(dst)
-
-    return n_parts
-
-
-# ── Main ─────────────────────────────────────────────────────────────────────
 
 
 def main() -> None:
@@ -258,7 +86,7 @@ def main() -> None:
     logger.info(f"Output format    : {cfg.output_format}")
     logger.info(f"Datasets         : {cfg.datasets}")
     if args.force:
-        logger.info("Force mode       : ON (ignoring completed stages)")
+        logger.info("Force mode       : ON")
 
     # ── heavy nemo_curator imports (lazy — only now) ─────────────────────
     os.environ.setdefault("RAPIDS_NO_INITIALIZE", "1")
@@ -295,14 +123,15 @@ def main() -> None:
                 ccfg = cfg.for_config(config_name)
                 logger.info(f"  ▸ config={config_name!r}  split={split!r}")
 
-                raw_dir, pre_dir = create_output_dirs(
+                raw_dir, pre_dir, _, _ = create_output_dirs(
                     base_dir, dataset_name, config_name, split,
                 )
 
-                # ── check resume status ──────────────────────────────
+                cleanup_raw_temps(raw_dir)
+
                 pre_status, pre_count = check_stage_status(pre_dir)
                 logger.info(
-                    f"    preprocessed/ status={pre_status.value} "
+                    f"    preprocessed/ {pre_status.value} "
                     f"({pre_count} file(s))"
                 )
 
@@ -322,7 +151,6 @@ def main() -> None:
                     logger.info("    Cleaning up partial run …")
                     cleanup_partial(pre_dir)
 
-                # ── build pipeline ───────────────────────────────────
                 pipeline = Pipeline(
                     name=(
                         f"hf_download_{dataset_name.replace('/', '_')}"
@@ -352,17 +180,15 @@ def main() -> None:
                     else JsonlWriter(path=str(pre_dir))
                 )
 
-                # ── execute ──────────────────────────────────────────
                 logger.info(f"    Running pipeline: {pipeline.name}")
                 results = pipeline.run()
 
                 if ccfg.output_format == "parquet":
-                    rechunk_parquet(pre_dir, ccfg.chunk_size)
+                    n = rechunk_parquet(pre_dir, ccfg.chunk_size)
+                    logger.info(f"    Chunked into {n} file(s)")
 
                 n_tasks = len(results) if results else 0
-                logger.info(
-                    f"    Pipeline completed — {n_tasks} task(s)"
-                )
+                logger.info(f"    Done — {n_tasks} task(s)")
 
                 summary.append({
                     "dataset": dataset_name,
@@ -383,8 +209,7 @@ def main() -> None:
     for entry in summary:
         logger.info(
             f"  {entry['dataset']} / {entry['config']} / {entry['split']}:  "
-            f"{entry['tasks']} task(s)  →  {entry['output']}  "
-            f"[{entry['status']}]"
+            f"{entry['tasks']} task(s)  [{entry['status']}]  →  {entry['output']}"
         )
     logger.info(f"{'═' * 60}")
 
