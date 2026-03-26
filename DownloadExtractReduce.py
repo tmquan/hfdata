@@ -235,6 +235,7 @@ def reduce_embeddings(
     out_df = pd.DataFrame(result_cols)
     logger.info(f"    Reduced DataFrame: {out_df.shape} cols={list(out_df.columns)}")
 
+    red_dir.mkdir(parents=True, exist_ok=True)
     n_parts = 0
     for start in range(0, len(out_df), chunk_size):
         n_parts += 1

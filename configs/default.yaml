@@ -19,7 +19,7 @@ embedding_pooling: mean_pooling   # or last_token
 # ─── Pipeline ────────────────────────────────────────────────────────────────
 batch_size:          1      # model inference batch size (must fit GPU VRAM)
 num_gpus:            8
-max_seq_length:      8192
+max_seq_length:      32768  # 8192
 chunk_size:          50000  # records per output parquet partition
 files_per_partition: 1      # NeMo Curator ParquetReader setting
 
