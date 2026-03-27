@@ -6,7 +6,7 @@ _base: default.yaml
 
 model_id:      nvidia/llama-embed-nemotron-8b
 embedding_dim: 4096
-max_seq_length: 32768
+max_seq_length: 8192
 text_strategy: messages_list
 batch_size: 1
 
