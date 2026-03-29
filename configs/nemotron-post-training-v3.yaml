@@ -31,4 +31,4 @@ dataset_overrides:
     text_strategy: math_v2
   nvidia/Nemotron-SWE-v1:
     text_strategy: agentic
-    max_seq_length: 32768
+    # max_seq_length: 32768
