@@ -12,8 +12,8 @@ output_format: parquet   # or jsonl
 # embedding_dim: 4096
 # model_id:      nvidia/llama-nemotron-embed-1b-v2
 # embedding_dim: 2048
-model_id:      GreenNode/GreenNode-Embedding-Large-VN-Mixed-V1
-embedding_dim: 1024
+model_id:      microsoft/harrier-oss-v1-27b
+embedding_dim: 5376
 
 # ─── Text extraction ─────────────────────────────────────────────────────────
 text_strategy: auto   # auto | smart | messages_list | messages_concat | rl_blend | agentic | math_proof | math_v2 | raw_text
@@ -23,8 +23,8 @@ embedding_pooling: mean_pooling   # or last_token
 
 # ─── Pipeline ────────────────────────────────────────────────────────────────
 batch_size:          1      # model inference batch size (must fit GPU VRAM)
-num_gpus:            8
-max_seq_length:      8192   # 32768  # 8192
+num_gpus:            4
+max_seq_length:      8192
 chunk_size:          50000  # records per output parquet partition
 files_per_partition: 1      # NeMo Curator ParquetReader setting
 

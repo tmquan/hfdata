@@ -4,9 +4,9 @@ _base: default.yaml
 # Schema: input (list of messages) + output (string), or messages (list)
 # Strategy: messages_concat flattens input messages and appends output
 
-model_id:      nvidia/llama-embed-nemotron-8b
-embedding_dim: 4096
-max_seq_length: 8192
+model_id:      microsoft/harrier-oss-v1-27b
+embedding_dim: 5376
+max_seq_length: 32768
 text_strategy: messages_concat
 batch_size: 1
 
