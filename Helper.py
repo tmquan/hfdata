@@ -43,6 +43,12 @@ class PipelineConfig:
     reduce_n_components: int = 2
     config_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
     dataset_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
+    # If set for a repo id, use these HF config names instead of Hub list_dataset_configs
+    # (avoids bogus "default" when the API fails or the dataset has no default config).
+    hf_dataset_configs: dict[str, list[str]] = field(default_factory=dict)
+    # Optional: repo_id -> HF config name -> split name (when Hub/API says "train" but
+    # the dataset only exposes e.g. "data", or configs disagree on split names).
+    hf_dataset_splits: dict[str, dict[str, str]] = field(default_factory=dict)
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> PipelineConfig:
@@ -182,6 +188,11 @@ def _strategy_messages_concat(record: dict[str, Any]) -> str | None:
     messages = record.get("messages")
     if isinstance(messages, list):
         return _flatten_messages(messages)
+    # Plain document corpora (e.g. HF ``content`` config with markdown in ``content``/``text``)
+    for key in ("text", "content", "document", "body"):
+        val = record.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
     return None
 
 
@@ -384,30 +395,62 @@ def cleanup_raw_temps(directory: Path) -> None:
 # ── HuggingFace enumeration ─────────────────────────────────────────────────
 
 
-def enumerate_dataset_splits(dataset_name: str) -> list[tuple[str, str]]:
-    """Return every ``(config, split)`` pair for *dataset_name* via HF Hub."""
+def enumerate_dataset_splits(
+    dataset_name: str,
+    forced_configs: list[str] | None = None,
+    split_overrides: dict[str, str] | None = None,
+) -> list[tuple[str, str]]:
+    """Return every ``(config, split)`` pair for *dataset_name* via HF Hub.
+
+    If *forced_configs* is set (from YAML ``hf_dataset_configs``), use it instead
+    of ``datasets.get_dataset_config_names`` so multi-config datasets are not
+    collapsed to a single misleading ``default`` config.
+
+    If *split_overrides* is set (from YAML ``hf_dataset_splits``), keys are HF
+    config names and values are the exact split to use (e.g. ``content`` → ``data``
+    when ``get_dataset_split_names`` wrongly returns ``train``).
+    """
     from datasets import get_dataset_config_names, get_dataset_split_names
 
-    try:
-        configs = get_dataset_config_names(dataset_name, trust_remote_code=True)
-    except Exception:
-        configs = []
-    if not configs:
-        configs = ["default"]
+    if forced_configs:
+        configs = list(forced_configs)
+        logger.info(
+            f"Using {len(configs)} HF config(s) from config file "
+            f"for {dataset_name!r}: {configs}"
+        )
+    else:
+        try:
+            configs = get_dataset_config_names(dataset_name, trust_remote_code=True)
+        except Exception:
+            configs = []
+        if not configs:
+            configs = ["default"]
+            logger.warning(
+                f"No HF config names from Hub for {dataset_name!r} — "
+                f"using {configs!r}. Set ``hf_dataset_configs`` in YAML if this "
+                f"dataset needs metadata/content (or other) configs."
+            )
 
+    so = split_overrides or {}
     pairs: list[tuple[str, str]] = []
     for cfg in configs:
-        try:
-            splits = get_dataset_split_names(
-                dataset_name, cfg, trust_remote_code=True
+        if cfg in so:
+            splits = [so[cfg]]
+            logger.info(
+                f"Using split override for {dataset_name!r} config={cfg!r}: {splits[0]!r}"
             )
-        except Exception:
+        else:
             try:
                 splits = get_dataset_split_names(
-                    dataset_name, trust_remote_code=True
+                    dataset_name, cfg, trust_remote_code=True
                 )
             except Exception:
-                splits = ["train"]
+                try:
+                    splits = get_dataset_split_names(
+                        dataset_name, trust_remote_code=True
+                    )
+                except Exception:
+                    splits = ["train"]
         for sp in splits:
             pairs.append((cfg, sp))
     return pairs
@@ -482,7 +525,16 @@ def rechunk_parquet(directory: Path, chunk_size: int) -> int:
     tmp_parts: list[Path] = []
     for src in src_files:
         df = pd.read_parquet(src)
-        for start in range(0, len(df), chunk_size):
+        nrows = len(df)
+        if nrows == 0:
+            # Old bug: inner loop did nothing but we still unlinked → 0 output files.
+            logger.warning(
+                f"    Empty parquet (0 rows), removing {src.name!r}. "
+                f"Fix upstream download (wrong HF config?) — see hf_dataset_configs in YAML."
+            )
+            src.unlink()
+            continue
+        for start in range(0, nrows, chunk_size):
             part_idx += 1
             tmp = directory / f"_tmp_part_{part_idx:06d}.parquet"
             df.iloc[start : start + chunk_size].to_parquet(tmp, index=False)

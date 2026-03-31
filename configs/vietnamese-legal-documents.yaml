@@ -1,7 +1,32 @@
 _base: default.yaml
 
+# model_id:      nvidia/llama-embed-nemotron-8b
+model_id:      microsoft/harrier-oss-v1-27b
+embedding_dim: 32768
+max_seq_length: 5376
+# model_id:      microsoft/harrier-oss-v1-0.6b
+# model_id:      microsoft/harrier-oss-v1-270m
+
+# ``messages_concat`` only fits chat JSON (input/messages). This corpus uses ``content`` (markdown).
+# ``auto`` resolves ``text`` / ``content`` via TEXT_FIELD_CANDIDATES on the extractor path.
+text_strategy: auto
+batch_size: 1
+
 datasets:
   - th1nhng0/vietnamese-legal-documents
+
+# Required: this dataset has no useful Hub "default" config — without this, enumeration
+# falls back to config="default", downloads can be empty, and rechunk deletes files → 0 chunks.
+hf_dataset_configs:
+  th1nhng0/vietnamese-legal-documents:
+    - metadata
+    - content
+
+# ``content`` config only defines split ``data`` (not ``train``); wrong split → download error → empty preprocess.
+hf_dataset_splits:
+  th1nhng0/vietnamese-legal-documents:
+    content: data
+    metadata: train    # uncomment if your cache/Hub only exposes ``data`` for metadata too
 
 # Per-config overrides (key = HuggingFace config name)
 config_overrides:
@@ -9,6 +34,6 @@ config_overrides:
     skip_embedding: true
     chunk_size: 50000    # keep as single file (518K rows)
   content:
-    max_seq_length: 8192 # 32768
-    batch_size: 5
+    # max_seq_length: 32768 # 8192 # 32768
+    batch_size: 1
     chunk_size: 50000

@@ -194,7 +194,11 @@ def main() -> None:
             logger.info(f"Dataset: {dataset_name}")
 
             try:
-                pairs = enumerate_dataset_splits(dataset_name)
+                pairs = enumerate_dataset_splits(
+                    dataset_name,
+                    forced_configs=cfg.hf_dataset_configs.get(dataset_name),
+                    split_overrides=cfg.hf_dataset_splits.get(dataset_name),
+                )
             except Exception as exc:
                 logger.error(f"Failed to enumerate {dataset_name}: {exc}")
                 continue
