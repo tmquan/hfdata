@@ -16,6 +16,7 @@ uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu
 # or use the NGC container instead:
 # sudo docker run --gpus all -it --rm nvcr.io/nvidia/pytorch:25.11-py3
 
+pip install flash-attn --no-build-isolation 
 # ─── build deps (needed by native extensions) ───────────────────────────────
 uv pip install setuptools setuptools_scm setuptools_rust \
     wheel wheel_stub psutil pybind11

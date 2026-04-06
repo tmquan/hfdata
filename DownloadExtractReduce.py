@@ -47,12 +47,7 @@ _LIBRARY_PATCHES: list[tuple[str, str, str]] = [
     (
         "nemo_curator.stages.text.embedders.base",
         "AutoModel.from_pretrained(self.model_identifier, cache_dir=self.cache_dir, local_files_only=True)",
-        "AutoModel.from_pretrained(self.model_identifier, cache_dir=self.cache_dir, local_files_only=True, trust_remote_code=True, attn_implementation='eager')",
-    ),
-    (
-        "nemo_curator.stages.text.embedders.base",
-        "local_files_only=True, trust_remote_code=True)",
-        "local_files_only=True, trust_remote_code=True, attn_implementation='eager')",
+        "AutoModel.from_pretrained(self.model_identifier, cache_dir=self.cache_dir, local_files_only=True, trust_remote_code=True)",
     ),
     (
         "nemo_curator.stages.text.models.tokenizer",
