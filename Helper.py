@@ -488,6 +488,34 @@ def create_output_dirs(
     return raw_dir, pre_dir, emb_dir, red_dir
 
 
+# ── Embedding NaN audit ──────────────────────────────────────────────────────
+
+
+def audit_nan_embeddings(directory: Path, embedding_col: str = "embeddings") -> int:
+    """Log and count rows with NaN in *embedding_col* across parquets in *directory*.
+
+    Returns the total number of NaN rows found.
+    """
+    import numpy as np
+    import pandas as pd
+
+    total_nan = 0
+    total_rows = 0
+    for f in sorted(directory.glob("*.parquet")):
+        df = pd.read_parquet(f, columns=[embedding_col])
+        has_nan = df[embedding_col].apply(lambda v: np.isnan(v).any())
+        n_nan = int(has_nan.sum())
+        total_nan += n_nan
+        total_rows += len(df)
+    if total_nan:
+        logger.warning(
+            f"    {total_nan}/{total_rows} embedding rows contain NaN in {directory}"
+        )
+    else:
+        logger.info(f"    All {total_rows} embedding rows are finite")
+    return total_nan
+
+
 # ── Parquet rechunking ───────────────────────────────────────────────────────
 
 

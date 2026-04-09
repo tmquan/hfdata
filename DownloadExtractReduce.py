@@ -32,6 +32,7 @@ from custom_hf_source import HuggingFaceDownloadExtractStage
 from Helper import (
     PipelineConfig,
     StageStatus,
+    audit_nan_embeddings,
     check_stage_status,
     cleanup_partial,
     cleanup_raw_temps,
@@ -209,14 +210,21 @@ def reduce_embeddings(
     X = np.vstack(all_emb).astype(np.float32)
     logger.info(f"    Embedding matrix: {X.shape}")
 
+    nan_mask = np.isnan(X).any(axis=1)
+    n_nan = int(nan_mask.sum())
+    if n_nan:
+        logger.warning(f"    {n_nan}/{len(X)} rows contain NaN — excluded from reduction, filled with NaN in output")
+    valid_idx = ~nan_mask
+    X_clean = X[valid_idx]
+
     result_cols: dict[str, np.ndarray] = {}
     for method in methods:
         fn = _REDUCERS.get(method)
         if fn is None:
             logger.warning(f"    Unknown reduce method: {method!r} — skipping")
             continue
-        logger.info(f"    Running {method} …")
-        reduced = fn(X, n_components)
+        logger.info(f"    Running {method} ({len(X_clean)} valid rows) …")
+        reduced = fn(X_clean, n_components) if len(X_clean) > n_components else None
         if reduced is None:
             for i, axis in enumerate(_AXIS_NAMES[n_components]):
                 result_cols[f"{method}_{n_components}d_{axis}"] = np.full(len(X), np.nan)
@@ -225,7 +233,9 @@ def reduce_embeddings(
             reduced = reduced.to_numpy()
         reduced = np.asarray(reduced, dtype=np.float32)
         for i, axis in enumerate(_AXIS_NAMES[n_components]):
-            result_cols[f"{method}_{n_components}d_{axis}"] = reduced[:, i]
+            col = np.full(len(X), np.nan, dtype=np.float32)
+            col[valid_idx] = reduced[:, i]
+            result_cols[f"{method}_{n_components}d_{axis}"] = col
 
     out_df = pd.DataFrame(result_cols)
     logger.info(f"    Reduced DataFrame: {out_df.shape} cols={list(out_df.columns)}")
@@ -523,6 +533,7 @@ def main() -> None:
                     logger.info(f"    Running embedding pipeline …")
                     emb_results = pipeline_emb.run()
                     rechunk_parquet(emb_dir, ccfg.chunk_size)
+                    audit_nan_embeddings(emb_dir)
                     logger.info(
                         f"    Embedding complete — "
                         f"{len(emb_results) if emb_results else 0} task(s)"

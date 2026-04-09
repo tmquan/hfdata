@@ -31,6 +31,7 @@ from custom_hf_source import HuggingFaceDownloadExtractStage
 from Helper import (
     PipelineConfig,
     StageStatus,
+    audit_nan_embeddings,
     check_stage_status,
     cleanup_partial,
     cleanup_raw_temps,
@@ -368,6 +369,7 @@ def main() -> None:
                     emb_results = pipeline_emb.run()
                     emb_tasks = len(emb_results) if emb_results else 0
                     rechunk_parquet(emb_dir, ccfg.chunk_size)
+                    audit_nan_embeddings(emb_dir)
                     logger.info(
                         f"    Embedding complete — {emb_tasks} task(s)"
                     )
