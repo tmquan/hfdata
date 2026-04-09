@@ -116,7 +116,7 @@ jsonschema-specifications==2025.9.1
 jupyter_client==8.8.0
 jupyter_core==5.9.1
 jusText==3.0.1
-kaleido==1.2.0
+kaleido[chromium]==1.2.0
 langcodes==3.5.1
 libcudf-cu13==26.2.1
 libcugraph-cu13==26.2.0

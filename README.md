@@ -31,6 +31,15 @@ pip install --no-build-isolation /tmp/nemo-curator
 
 # ─── remaining deps ─────────────────────────────────────────────────────────
 uv pip install -r requirements.txt
+
+# ─── Plotly static-image export (Kaleido + Chromium) ─────────────────────────
+# Kaleido ≥ 1.0 needs Chrome/Chromium at runtime. The [chromium] extra
+# auto-downloads a bundled copy. If you already have Chrome installed system-
+# wide you can skip this, but the extra is included in requirements.txt by
+# default so it should just work.
+# On headless Linux you may also need:
+#   sudo apt-get install -y libnss3 libatk-bridge2.0-0 libdrm2 libxcomposite1 \
+#       libxdamage1 libxrandr2 libgbm1 libpango-1.0-0 libasound2
 ```
 
 ## Project Structure
