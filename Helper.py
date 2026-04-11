@@ -10,8 +10,28 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+import torch
 import yaml
 from loguru import logger
+
+_DTYPE_MAP: dict[str, torch.dtype] = {
+    "bfloat16": torch.bfloat16,
+    "bf16": torch.bfloat16,
+    "float16": torch.float16,
+    "fp16": torch.float16,
+    "float32": torch.float32,
+    "fp32": torch.float32,
+}
+
+
+def resolve_torch_dtype(name: str) -> torch.dtype:
+    """Map a human-friendly dtype string to a ``torch.dtype``."""
+    dt = _DTYPE_MAP.get(name.lower())
+    if dt is None:
+        raise ValueError(
+            f"Unknown model_dtype {name!r}; choose from {list(_DTYPE_MAP)}"
+        )
+    return dt
 
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -33,6 +53,7 @@ class PipelineConfig:
     model_id: str = "nvidia/llama-embed-nemotron-8b"
     embedding_dim: int = 4096
     embedding_pooling: str = "mean_pooling"
+    model_dtype: str = "bfloat16"
     batch_size: int = 8
     num_gpus: int = 8
     max_seq_length: int = 32768
@@ -492,28 +513,33 @@ def create_output_dirs(
 
 
 def audit_nan_embeddings(directory: Path, embedding_col: str = "embeddings") -> int:
-    """Log and count rows with NaN in *embedding_col* across parquets in *directory*.
+    """Log and count rows with NaN/None in *embedding_col* across parquets in *directory*.
 
-    Returns the total number of NaN rows found.
+    Returns the total number of bad rows found.
     """
     import numpy as np
     import pandas as pd
 
-    total_nan = 0
+    def _is_bad(v: Any) -> bool:
+        arr = np.asarray(v)
+        if arr.dtype == object:
+            return any(x is None for x in arr.flat)
+        return bool(np.isnan(arr).any())
+
+    total_bad = 0
     total_rows = 0
     for f in sorted(directory.glob("*.parquet")):
         df = pd.read_parquet(f, columns=[embedding_col])
-        has_nan = df[embedding_col].apply(lambda v: np.isnan(v).any())
-        n_nan = int(has_nan.sum())
-        total_nan += n_nan
+        n_bad = int(df[embedding_col].apply(_is_bad).sum())
+        total_bad += n_bad
         total_rows += len(df)
-    if total_nan:
+    if total_bad:
         logger.warning(
-            f"    {total_nan}/{total_rows} embedding rows contain NaN in {directory}"
+            f"    {total_bad}/{total_rows} embedding rows contain NaN/None in {directory}"
         )
     else:
         logger.info(f"    All {total_rows} embedding rows are finite")
-    return total_nan
+    return total_bad
 
 
 # ── Parquet rechunking ───────────────────────────────────────────────────────

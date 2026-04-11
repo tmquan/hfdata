@@ -39,6 +39,7 @@ from Helper import (
     create_output_dirs,
     enumerate_dataset_splits,
     rechunk_parquet,
+    resolve_torch_dtype,
 )
 
 
@@ -207,7 +208,20 @@ def reduce_embeddings(
     for f in emb_files:
         df = pd.read_parquet(f)
         all_emb.append(np.stack(df["embeddings"].values))
-    X = np.vstack(all_emb).astype(np.float32)
+    X_raw = np.vstack(all_emb)
+
+    if X_raw.dtype == object:
+        n_none = sum(1 for row in X_raw if any(v is None for v in row))
+        if n_none == len(X_raw):
+            logger.error(
+                f"    ALL {len(X_raw)} embedding rows are None-filled "
+                f"(model produced no output). Re-run the embedding stage."
+            )
+            return 0
+        if n_none:
+            logger.warning(f"    {n_none}/{len(X_raw)} rows contain None values")
+
+    X = X_raw.astype(np.float32)
     logger.info(f"    Embedding matrix: {X.shape}")
 
     nan_mask = np.isnan(X).any(axis=1)
@@ -216,6 +230,13 @@ def reduce_embeddings(
         logger.warning(f"    {n_nan}/{len(X)} rows contain NaN — excluded from reduction, filled with NaN in output")
     valid_idx = ~nan_mask
     X_clean = X[valid_idx]
+
+    if len(X_clean) == 0:
+        logger.error(
+            f"    No valid embedding rows after NaN filtering. "
+            f"Skipping reduction — output will be all NaN."
+        )
+        return 0
 
     result_cols: dict[str, np.ndarray] = {}
     for method in methods:
@@ -522,6 +543,9 @@ def main() -> None:
                                 max_chars=None,
                                 embedding_pooling=ccfg.embedding_pooling,
                                 model_inference_batch_size=ccfg.batch_size,
+                                transformers_init_kwargs={
+                                    "torch_dtype": resolve_torch_dtype(ccfg.model_dtype),
+                                },
                             ),
                             ParquetWriter(
                                 path=str(emb_dir),

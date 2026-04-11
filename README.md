@@ -37,9 +37,10 @@ uv pip install -r requirements.txt
 # auto-downloads a bundled copy. If you already have Chrome installed system-
 # wide you can skip this, but the extra is included in requirements.txt by
 # default so it should just work.
-# On headless Linux you may also need:
-#   sudo apt-get install -y libnss3 libatk-bridge2.0-0 libdrm2 libxcomposite1 \
-#       libxdamage1 libxrandr2 libgbm1 libpango-1.0-0 libasound2
+# On headless Linux you also need Chromium's shared-library deps:
+sudo apt-get install -y libnss3 libatk-bridge2.0-0 libcups2 \
+    libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 \
+    libxkbcommon0 libpango-1.0-0 libcairo2 libasound2t64
 ```
 
 ## Project Structure

@@ -38,6 +38,7 @@ from Helper import (
     create_output_dirs,
     enumerate_dataset_splits,
     rechunk_parquet,
+    resolve_torch_dtype,
 )
 
 
@@ -357,6 +358,9 @@ def main() -> None:
                                 max_chars=None,
                                 embedding_pooling=ccfg.embedding_pooling,
                                 model_inference_batch_size=ccfg.batch_size,
+                                transformers_init_kwargs={
+                                    "torch_dtype": resolve_torch_dtype(ccfg.model_dtype),
+                                },
                             ),
                             ParquetWriter(
                                 path=str(emb_dir),

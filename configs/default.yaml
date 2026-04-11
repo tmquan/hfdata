@@ -20,6 +20,7 @@ text_strategy: auto   # auto | smart | messages_list | messages_concat | rl_blen
 
 # ─── Embedding ───────────────────────────────────────────────────────────────
 embedding_pooling: mean_pooling   # or last_token
+model_dtype: bfloat16             # bfloat16 (safe default) | float16 | float32
 
 # ─── Pipeline ────────────────────────────────────────────────────────────────
 batch_size:          1      # model inference batch size (must fit GPU VRAM)
