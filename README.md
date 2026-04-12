@@ -136,6 +136,7 @@ child YAML that sets `_base: default.yaml`:
 | `model_id`         | `nvidia/llama-embed-nemotron-8b`   | Embedding model                          |
 | `embedding_dim`    | `4096`                             | Model embedding dimension                |
 | `text_strategy`    | `auto`                             | Text extraction strategy (see below)     |
+| `model_dtype`      | `bfloat16`                         | Model precision: `bfloat16` / `float16` / `float32` |
 | `batch_size`       | `1`                                | Inference batch size (must fit GPU VRAM)  |
 | `num_gpus`         | `8`                                | Number of GPUs for Ray pipeline          |
 | `max_seq_length`   | `8192`                             | Max input tokens                         |
